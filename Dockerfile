@@ -1,1 +1,1 @@
-FROM python:latest
+FROM cgr.dev/andrewd.dev/python:latest
