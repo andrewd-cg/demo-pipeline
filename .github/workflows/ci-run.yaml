@@ -1,0 +1,221 @@
+name: Demo CI
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  REPO_NAME: ${{ github.repository }}
+
+jobs:
+  find-base-image:
+    name: Find Base Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      base: ${{ steps.base.outputs.base }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: base
+        run: |
+          set -euo pipefail
+          base=$(grep '^FROM' Dockerfile | tail -n1 | awk '{print $2}')
+          echo "Extracted base image: $base"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+
+  check-image-signed:
+    name: Base Image Signed
+    needs: find-base-image
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # Needed for OIDC auth to chainguard
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/chainguard-auth
+      - uses: sigstore/cosign-installer@v3.10.1
+
+      - name: Check if base image is signed
+        run: |
+          set -eo pipefail
+          echo "Verifying that ${{ needs.find-base-image.outputs.base }} is signed by anyone"
+
+          set +e
+          cosign verify \
+            --certificate-identity-regexp '.*' \
+            --certificate-oidc-issuer-regexp '.*' \
+            "${{ needs.find-base-image.outputs.base }}" >/dev/null 2>&1
+          exit_code=$?
+          set -e
+
+          if [ $exit_code -ne 0 ]; then
+            echo "::error::Image is not signed. Please use a signed base image."
+            exit $exit_code
+          fi
+          echo "✓ Image is signed"
+
+  confirm-image-signed-by-chainguard:
+    name: Base Image Signed by Chainguard
+    needs: find-base-image
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # Needed for OIDC auth to chainguard
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/chainguard-auth
+      - uses: sigstore/cosign-installer@v3.10.1
+
+      - name: Verify signature by Chainguard issuers
+        run: |
+          set -eo pipefail
+          echo "Verifying image signature for ${{ needs.find-base-image.outputs.base }}"
+
+          set +e
+          cosign verify \
+            --certificate-oidc-issuer=https://issuer.enforce.dev \
+            --certificate-identity-regexp="https://issuer.enforce.dev/(9188682cf9821b6157bb8a00d8376efc4a2933e3/24953c0de62056e6|9188682cf9821b6157bb8a00d8376efc4a2933e3/d43a113d8645c826)" \
+            "${{ needs.find-base-image.outputs.base }}" >/dev/null 2>&1
+          exit_code=$?
+          set -e
+
+          if [ $exit_code -ne 0 ]; then
+            echo "::error::Image is not signed by Chainguard. Chainguard-signed images are required."
+            exit $exit_code
+          fi
+          echo "✓ Image is signed by Chainguard"
+
+  confirm-image-spdx-sbom:
+    name: SPDX SBOM Attestation
+    needs: find-base-image
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # Needed for OIDC auth to chainguard
+      contents: read
+    steps:
+      - uses: sigstore/cosign-installer@v3.10.1
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/chainguard-auth
+
+      - name: Require SPDX SBOM attestation
+        run: |
+          set -eo pipefail
+
+          set +e
+          cosign download attestation \
+            --predicate-type=https://spdx.dev/Document \
+            "${{ needs.find-base-image.outputs.base }}" >/dev/null 2>&1
+          exit_code=$?
+          set -e
+
+          if [ $exit_code -ne 0 ]; then
+            echo "::error::Image does not have an SPDX SBOM attestation."
+            exit $exit_code
+          fi
+          echo "✓ Image has an SPDX SBOM attestation"
+
+  check-if-image-distroless:
+    name: Distoless image check
+    needs: find-base-image
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # Needed for OIDC auth to chainguard
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/chainguard-auth
+      - uses: anchore/sbom-action@v0
+        with:
+          image: ${{ needs.find-base-image.outputs.base }}
+          format: json
+          output-file: sbom.json
+
+      - name: Policy check - distroless
+        id: analyze
+        run: |
+          set -euo pipefail
+          echo "Checking if image is distroless for ${{ needs.find-base-image.outputs.base }}"
+
+          # Detect shells (check both package names and file paths)
+          shell_packages=$(jq -r '.artifacts[] | select(.name | test("^(bash|busybox|zsh)$")) | .name' sbom.json || true)
+          shell_files=$(jq -r '.files[]? | .location.path' sbom.json | grep -E '/(bash|sh|busybox|zsh)$' || true)
+          shells=$(echo -e "$shell_packages\n$shell_files" | grep -v '^$' | sort -u || true)
+          if [[ -n "$shells" ]]; then
+            has_shell=true
+            echo "Detected shells:"
+            echo "$shells"
+          else
+            has_shell=false
+            echo "No shells detected"
+          fi
+
+          # Detect distro (informational only)
+          distro=$(jq -r '.distro.name' sbom.json 2>/dev/null | grep -Ei 'alpine|debian|ubuntu|wolfi|chainguard|rhel|centos|fedora|opensuse|arch' || true)
+          if [[ -n "$distro" ]]; then
+            echo "Detected distro: $distro"
+          else
+            echo "No distro information found"
+          fi
+
+          # Detect package managers (fails distroless check)
+          pkgmgrs=$(jq -r '.artifacts[].name' sbom.json | grep -Ei 'apk-tools|dpkg|rpm|pacman' || true)
+          if [[ -n "$pkgmgrs" ]]; then
+            has_pkgmgr=true
+            echo "Detected package managers:"
+            echo "$pkgmgrs"
+          else
+            has_pkgmgr=false
+            echo "No package managers detected"
+          fi
+
+          echo "Summary: has_shell=$has_shell has_pkgmgr=$has_pkgmgr"
+          if [[ "$has_shell" == true || "$has_pkgmgr" == true ]]; then
+            echo "::error::Image is not distroless."
+            exit 1
+          fi
+          echo "✓ Image is distroless"
+
+  scan-image-for-vulnerabilities:
+    name: Vulnerability Scan
+    needs: find-base-image
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # Needed for OIDC auth to chainguard
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/chainguard-auth
+      - uses: anchore/scan-action@v3.6.4
+        id: grype
+        with:
+          image: ${{ needs.find-base-image.outputs.base }}
+          severity-cutoff: high
+          fail-build: true
+          output-format: sarif
+          by-cve: true
+
+
+      # uncomment if repo has code scanning enabled
+      # - uses: github/codeql-action/upload-sarif@v3
+      #   with:
+      #     sarif_file: ${{ steps.grype.outputs.sarif }}
+
+  # build-and-push could go here, only if you actually build anything
+  # build:
+  #   needs: [verify, scan]
+  #   runs-on: ubuntu-latest
+  #   permissions:
+  #     contents: read
+  #     packages: write
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - name: docker login
+  #       uses: docker/login-action@v3
+  #       with:
+  #         registry: ${{ env.REGISTRY }}
+  #         username: ${{ github.actor }}
+  #         password: ${{ secrets.GITHUB_TOKEN }}
+  #     - run: docker push -a ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
